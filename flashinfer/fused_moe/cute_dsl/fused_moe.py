@@ -142,7 +142,8 @@ def _check_clamped_relu2_supported(
     activation: ActivationType, quant_mode: str, device: Union[str, torch.device]
 ) -> None:
     """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16 and the
-    Rubin (SM107) kernels do not implement it."""
+    Rubin (SM107) NVFP4 kernels do not implement it. MXFP8 runs the SM100-family
+    kernels on SM107 too, so it is supported there."""
     if activation != ActivationType.ClampedRelu2:
         return
     if quant_mode == "w4a16":
@@ -151,11 +152,15 @@ def _check_clamped_relu2_supported(
         )
     device = torch.device(device)
     if (
-        device.type == "cuda"
+        quant_mode != "mxfp8"
+        and device.type == "cuda"
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability(device) == (10, 7)
     ):
-        raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
+        raise ValueError(
+            "ActivationType.ClampedRelu2 is not supported on SM107 for "
+            f"quant_mode={quant_mode!r}"
+        )
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
@@ -215,7 +220,20 @@ def _check_gemm2_input_scale(
         weakref.finalize(fc2_input_scale, _validated_gemm2_input_scales.discard, key)
 
 
-def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list]) -> int:
+def _localized_fc2_split(localized_options: Optional[dict]) -> str:
+    """How locality-domain shards divide FC2: "n" (hidden columns, the W4A4 path) or
+    "k" (reduction columns, the MXFP8 intermediate split + add path)."""
+    fc2_split = (localized_options or {}).get("fc2_split", "n")
+    if fc2_split not in ("n", "k"):
+        raise ValueError(
+            f"localized_options['fc2_split'] must be 'n' or 'k', got {fc2_split!r}"
+        )
+    return fc2_split
+
+
+def _moe_hidden_size(
+    w2_weight: torch.Tensor, localized_weights: Optional[list], fc2_split: str = "n"
+) -> int:
     if localized_weights is None:
         return w2_weight.size(1)
     if len(localized_weights) != 2:
@@ -227,6 +245,9 @@ def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list])
         raise ValueError(
             f"localized FC2 shards must have equal positive widths, got {widths}"
         )
+    if fc2_split == "k":
+        # Each die holds a K shard of every expert's w2 at the full hidden width.
+        return widths[0]
     return sum(widths)
 
 
@@ -311,6 +332,276 @@ def validate_w4a8_inputs(
             )
 
 
+def _localized_intermediate_split_pipelines(
+    *,
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    localized_weights: list,
+    localized_streams: list,
+    localized_options: dict,
+    sm_count: int,
+    moe_output: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    gated: bool,
+    weight_dtype: str,
+    activation,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+    clamped_relu2_limit: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+    enable_pdl: bool,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    gemm1_mma_tiler_mn,
+    gemm1_cluster_shape_mn,
+    gemm2_mma_tiler_mn,
+    gemm2_cluster_shape_mn,
+) -> torch.Tensor:
+    """Locality-domain MXFP8 MoE, intermediate split + add (fc2_split="k"): two
+    independent per-die pipelines over every local expert's intermediate halves.
+
+    Die d runs FC1 on its N shard of w1 into a private intermediate (data and
+    scales) in its own memory, then FC2 on the matching K shard of w2,
+    accumulating into the shared, zeroed token output with the fused atomic
+    finalize. Both dies' partial sums are added atomically, so there is no
+    shared FC1 buffer, no column offset and no event between FC1 and FC2:
+    programmatic dependent launch chains FC1 -> FC2 on each green-context
+    stream, and the only joins are the fork after routing and the final join.
+    The token output is zeroed on the main stream while FC1 runs
+    (output_memset="overlap_fc1"; the dies wait for it before FC2) or before
+    the fork ("before_fork").
+
+    fc2_accumulator="float32" (default): both dies reduce into a float32
+    accumulator (fp32 atomics; one rounding to the output dtype after the
+    join), which is at least as precise as the unsharded kernel. "output"
+    reduces straight into the BF16 token output: each contribution is then
+    rounded twice (once per K half), and when the halves cancel the error can
+    exceed the unsharded kernel's BF16-atomic bound several times over.
+
+    localized_options keys: fc2_split="k", output_memset, fc2_accumulator,
+    output_accumulator (optional float32 [>= num_tokens, hidden] buffer for
+    fc2_accumulator="float32"), gemm1_out and gemm1_out_scale (optional
+    per-die persistent FC1 output buffers, [>= permuted_m, I/2] float8_e4m3fn
+    and (32, 4, >= permuted_m/128, 4, I/256, 1) uint8).
+    """
+    if weight_dtype != "float8_e4m3fn":
+        raise NotImplementedError(
+            "localized fc2_split='k' is implemented for MXFP8 x MXFP8 only"
+        )
+    output_memset = localized_options.get("output_memset", "overlap_fc1")
+    if output_memset not in ("overlap_fc1", "before_fork"):
+        raise ValueError(
+            "localized_options['output_memset'] must be 'overlap_fc1' or "
+            f"'before_fork', got {output_memset!r}"
+        )
+    accumulator = localized_options.get("fc2_accumulator", "float32")
+    if accumulator not in ("float32", "output"):
+        raise ValueError(
+            "localized_options['fc2_accumulator'] must be 'float32' or 'output', "
+            f"got {accumulator!r}"
+        )
+    fc1_widths = [
+        s["w1_weight"].shape[1] // (2 if gated else 1) for s in localized_weights
+    ]
+    width = fc1_widths[0]
+    if width <= 0 or width % 128 != 0 or any(w != width for w in fc1_widths):
+        raise ValueError(
+            "localized fc2_split='k' shards must produce the same positive multiple "
+            f"of 128 FC1 output columns; got {fc1_widths}"
+        )
+    for i, s in enumerate(localized_weights):
+        if s["w2_weight"].shape[2] != width:
+            raise ValueError(
+                f"localized fc2_split='k': shard {i} w2 has K={s['w2_weight'].shape[2]} "
+                f"but its FC1 shard produces {width} columns"
+            )
+    permuted_m = permuted_idx_to_expanded_idx.shape[0]
+    if permuted_m % 128 != 0:
+        raise ValueError(
+            f"locality-domain mode requires permuted_m ({permuted_m}) to be a multiple of 128"
+        )
+    k_tiles = width // 128
+    rows_tiles = permuted_m // 128
+    given_out = localized_options.get("gemm1_out")
+    given_sf = localized_options.get("gemm1_out_scale")
+    gemm1_outs, gemm1_sfs = [], []
+    for i in range(len(localized_weights)):
+        if given_out is not None:
+            o = given_out[i]
+            if (
+                o.dtype != torch.float8_e4m3fn
+                or o.dim() != 2
+                or o.shape[0] < permuted_m
+                or o.shape[1] != width
+                or not o.is_contiguous()
+            ):
+                raise ValueError(
+                    f"localized gemm1_out[{i}] must be a contiguous float8_e4m3fn "
+                    f"[>= {permuted_m}, {width}] tensor, got {tuple(o.shape)} {o.dtype}"
+                )
+            o = o[:permuted_m]
+        else:
+            o = torch.empty(
+                (permuted_m, width), dtype=torch.float8_e4m3fn, device=x.device
+            )
+        if given_sf is not None:
+            sf = given_sf[i]
+            if (
+                sf.dtype != torch.uint8
+                or not sf.is_contiguous()
+                or sf.dim() != 6
+                or sf.shape[4] != k_tiles
+                or sf.shape[2] < rows_tiles
+            ):
+                raise ValueError(
+                    f"localized gemm1_out_scale[{i}] must be a contiguous uint8 "
+                    f"(32, 4, >= {rows_tiles}, 4, {k_tiles}, 1) tensor, got {tuple(sf.shape)}"
+                )
+            # Physical order is (row tiles, k tiles, 32, 4, 4): a prefix of a
+            # larger buffer is the buffer of fewer row tiles.
+            sf = sf.view(-1)[: rows_tiles * k_tiles * 512].view(
+                32, 4, rows_tiles, 4, k_tiles, 1
+            )
+        else:
+            sf = torch.empty(
+                (32, 4, rows_tiles, 4, k_tiles, 1), dtype=torch.uint8, device=x.device
+            )
+        gemm1_outs.append(o)
+        gemm1_sfs.append(sf)
+
+    hidden = localized_weights[0]["w2_weight"].shape[1]
+    if accumulator == "float32":
+        fc2_out = localized_options.get("output_accumulator")
+        if fc2_out is None:
+            fc2_out = torch.empty(
+                (num_tokens, hidden), dtype=torch.float32, device=x.device
+            )
+        elif (
+            fc2_out.dtype != torch.float32
+            or fc2_out.dim() != 2
+            or fc2_out.shape[0] < num_tokens
+            or fc2_out.shape[1] != hidden
+            or not fc2_out.is_contiguous()
+        ):
+            raise ValueError(
+                "localized output_accumulator must be a contiguous float32 "
+                f"[>= {num_tokens}, {hidden}] tensor, got {tuple(fc2_out.shape)} {fc2_out.dtype}"
+            )
+        else:
+            fc2_out = fc2_out[:num_tokens]
+        fc2_out_dtype = "float32"
+    else:
+        fc2_out = moe_output
+        fc2_out_dtype = _intermediate_c_dtype(output_dtype)
+
+    # cudaMemsetAsync on the accumulator's bytes (the helper takes 16-bit views).
+    fc2_out_bytes_view = (
+        fc2_out if fc2_out.dtype != torch.float32 else fc2_out.view(torch.bfloat16)
+    )
+
+    main_stream = torch.cuda.current_stream()
+    if output_memset == "before_fork":
+        moe_output_memset_inplace(fc2_out_bytes_view)
+    fork_event = torch.cuda.Event()
+    fork_event.record(main_stream)
+    for stream in localized_streams:
+        stream.wait_event(fork_event)
+    # Enqueue both dies' FC1 first (so neither launch trails the other's
+    # work in the captured graph), then zero the accumulator on the idle main
+    # stream, then both dies' FC2.
+    for i, stream in enumerate(localized_streams):
+        shard = localized_weights[i]
+        with torch.cuda.stream(stream):
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+                a=x,
+                b=shard["w1_weight"],
+                a_scale=x_sf,
+                b_scale=shard["w1_weight_sf"],
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_outs[i],
+                out_scale=gemm1_sfs[i],
+                global_scale=None,
+                a_per_token_scale=None,
+                c_dtype="float8_e4m3fn",
+                a_dtype="float8_e4m3fn",
+                b_dtype=weight_dtype,
+                sf_dtype="float8_e8m0fnu",
+                sf_vec_size=32,
+                quantize_output=True,
+                topk=top_k,
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                sm_count=sm_count,
+                enable_pdl=enable_pdl,
+                activation_type=activation.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                gated=gated,
+                clamped_relu2_limit=clamped_relu2_limit,
+            )
+    memset_done = None
+    if output_memset == "overlap_fc1":
+        # The main stream is idle while both dies run FC1.
+        moe_output_memset_inplace(fc2_out_bytes_view)
+        memset_done = torch.cuda.Event()
+        memset_done.record(main_stream)
+    done_events = []
+    for i, stream in enumerate(localized_streams):
+        shard = localized_weights[i]
+        with torch.cuda.stream(stream):
+            if memset_done is not None:
+                stream.wait_event(memset_done)
+            blockscaled_contiguous_grouped_gemm_finalize_fusion(
+                a=gemm1_outs[i],
+                b=shard["w2_weight"],
+                a_scale=gemm1_sfs[i],
+                b_scale=shard["w2_weight_sf"],
+                alpha=w2_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                token_final_scales=token_final_scales,
+                out=fc2_out,
+                a_per_token_scale=None,
+                a_dtype="float8_e4m3fn",
+                b_dtype=weight_dtype,
+                sf_dtype="float8_e8m0fnu",
+                sf_vec_size=32,
+                out_dtype=fc2_out_dtype,
+                mma_tiler_mn=gemm2_mma_tiler_mn,
+                cluster_shape_mn=gemm2_cluster_shape_mn,
+                sm_count=sm_count,
+                enable_pdl=enable_pdl,
+                use_fused_finalize=True,
+            )
+            done_event = torch.cuda.Event()
+            done_event.record(stream)
+            done_events.append(done_event)
+    for done_event in done_events:
+        main_stream.wait_event(done_event)
+    if accumulator == "float32":
+        # One rounding of the fp32 sum of both dies' partial sums.
+        moe_output[:num_tokens].copy_(fc2_out)
+    return moe_output[:num_tokens]
+
+
 def _moe_core_impl(
     # Input
     x: torch.Tensor,
@@ -358,6 +649,12 @@ def _moe_core_impl(
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
+    # fc2_split ("n": shared FC1 buffer, FC2 hidden-column shards, a join between
+    # FC1 and FC2; "k": per-die FC1 intermediate halves into private buffers, FC2
+    # reduction-column shards, both dies add into the token output, no join),
+    # output_memset, fc2_accumulator and the per-die gemm1_out / gemm1_out_scale
+    # buffers of the "k" path. See _localized_intermediate_split_pipelines.
+    localized_options: Optional[dict] = None,
     # Stream resources
     aux_stream: Optional[torch.cuda.Stream] = None,
     main_event: Optional[torch.cuda.Event] = None,
@@ -469,10 +766,15 @@ def _moe_core_impl(
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
     if weight_dtype is None:
-        # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
+        # The localized path may pass w1_weight=None; read the shards instead.
+        probe_weight = (
+            w1_weight
+            if w1_weight is not None or localized_weights is None
+            else localized_weights[0]["w1_weight"]
+        )
         weight_dtype = (
             "float8_e4m3fn"
-            if w1_weight is not None and w1_weight.dtype == torch.float8_e4m3fn
+            if probe_weight is not None and probe_weight.dtype == torch.float8_e4m3fn
             else "float4_e2m1fn"
         )
     if weight_dtype not in ("float4_e2m1fn", "float8_e4m3fn"):
@@ -507,19 +809,29 @@ def _moe_core_impl(
     )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
-        validate_w4a8_inputs(
-            x,
-            x_sf,
-            token_final_scales,
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            weight_elems_per_byte=weight_elems_per_byte,
-        )
+        # The localized path may pass no full-width weights: check each shard.
+        for w1_, w1_sf_, w2_, w2_sf_ in (
+            [(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf)]
+            if localized_weights is None
+            else [
+                (s["w1_weight"], s["w1_weight_sf"], s["w2_weight"], s["w2_weight_sf"])
+                for s in localized_weights
+            ]
+        ):
+            validate_w4a8_inputs(
+                x,
+                x_sf,
+                token_final_scales,
+                w1_,
+                w1_sf_,
+                w2_,
+                w2_sf_,
+                weight_elems_per_byte=weight_elems_per_byte,
+            )
 
     num_tokens = token_selected_experts.size(0)
-    hidden_size = _moe_hidden_size(w2_weight, localized_weights)
+    fc2_split = _localized_fc2_split(localized_options)
+    hidden_size = _moe_hidden_size(w2_weight, localized_weights, fc2_split)
     use_per_token_activation = per_token_scale is not None
 
     # A pinned recipe is either honored or refused: the GEMM2-input quantizer
@@ -532,9 +844,18 @@ def _moe_core_impl(
     # than silently diverging from them.
     use_localized_path = localized_weights is not None
     if use_localized_path:
-        if is_mxfp8:
+        if is_mxfp8 and (weight_dtype != "float8_e4m3fn" or fc2_split != "k"):
             raise NotImplementedError(
-                "locality-domain localization is implemented for W4A4 only"
+                "locality-domain localization of MXFP8 activations is implemented for "
+                "MXFP8 weights with localized_options fc2_split='k' only"
+            )
+        if not is_mxfp8 and fc2_split != "n":
+            raise NotImplementedError(
+                "locality-domain localization of W4A4 is implemented for fc2_split='n' only"
+            )
+        if is_mxfp8 and swap_ab:
+            raise NotImplementedError(
+                "locality-domain localization of MXFP8 requires swap_ab=False"
             )
         if len(localized_weights) != 2:
             raise ValueError(
@@ -632,11 +953,14 @@ def _moe_core_impl(
             "mma_tiler": gemm2_mma_tiler,
             "mma_inst_shape": gemm2_mma_inst_shape,
         }
-    # Reject before routing so an unsupported call does no GPU work.
-    if use_localized_path and not is_rubin:
+    # Reject before routing so an unsupported call does no GPU work. MXFP8 runs the
+    # SM100-family kernels on SM107, so its localized path is gated on the device.
+    if use_localized_path and torch.cuda.get_device_capability(x.device) != (10, 7):
+        raise NotImplementedError("locality-domain localization is Rubin (SM107) only")
+    if use_localized_path and fc2_split == "n" and not is_rubin:
         raise NotImplementedError(
-            "locality-domain localization is Rubin (SM107) only; pass gemm1_mma_tiler / "
-            "gemm1_mma_inst_shape."
+            "locality-domain localization with fc2_split='n' needs the SM107 kernels; "
+            "pass gemm1_mma_tiler / gemm1_mma_inst_shape."
         )
 
     # Rubin clusters that span several routing tiles along M are filtered out
@@ -691,6 +1015,44 @@ def _moe_core_impl(
         enable_pdl=enable_pdl,
         **moe_sort_kwargs,
     )
+
+    if use_localized_path and fc2_split == "k":
+        # Intermediate split + add: one shared routing, then each die runs FC1 on
+        # its intermediate half and FC2 on the matching K half, adding into the
+        # token output; no join between FC1 and FC2.
+        return _localized_intermediate_split_pipelines(
+            x=x,
+            x_sf=x_sf,
+            w1_alpha=w1_alpha,
+            w2_alpha=w2_alpha,
+            token_final_scales=token_final_scales,
+            localized_weights=localized_weights,
+            localized_streams=localized_streams,
+            localized_options=localized_options or {},
+            sm_count=sm_count,
+            moe_output=moe_output,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            gated=gated,
+            weight_dtype=weight_dtype,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
+            gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
+            gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
+            gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+        )
 
     if use_localized_path:
         # Allocate once: both domains fill disjoint columns of this buffer.
@@ -1675,6 +2037,7 @@ def _cute_dsl_fused_moe_impl(
     gemm1_use_clc_scheduler: bool = True,
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
+    localized_options: Optional[dict] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1726,6 +2089,7 @@ def _cute_dsl_fused_moe_impl(
         gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
         gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
         swap_ab=swap_ab,
+        localized_options=localized_options,
     )
 
 
@@ -1769,6 +2133,7 @@ def cute_dsl_fused_moe(
     localized_sm_count: Optional[int] = None,
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
+    localized_options: Optional[dict] = None,
     autotune_use_cuda_graph: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
@@ -1947,6 +2312,23 @@ def cute_dsl_fused_moe(
     localized_allow_nonlocalized : bool
         Include the full-width path in autotuning when localized weights are
         supplied. The caller must retain usable full-width weights.
+    localized_options : Optional[dict]
+        How the locality domains divide the work. ``fc2_split="n"`` (default)
+        is the W4A4 path above: a shared FC1 output, FC2 shards over hidden
+        columns, a join between FC1 and FC2. ``fc2_split="k"`` is the MXFP8
+        intermediate split + add (``quant_mode="mxfp8"`` only): shard ``i``
+        holds rows ``[i*I/2, (i+1)*I/2)`` of every expert's FC1 (``[E, I/2, H]``)
+        and the same columns of its FC2 (``[E, H, I/2]``), with the scale
+        factors sliced at 128-row atoms and swizzled per shard. Each die runs
+        FC1 into a private intermediate in its own memory and FC2 over its K
+        half, and both dies add their partial sums into the token output with
+        the fused atomic finalize, so there is no join between FC1 and FC2.
+        Further keys of the ``"k"`` path: ``fc2_accumulator`` (``"float32"``,
+        the default, sums both dies in an fp32 buffer and rounds once;
+        ``"output"`` adds BF16 partials straight into the output),
+        ``output_memset`` (``"overlap_fc1"`` or ``"before_fork"``), and the
+        optional per-die ``gemm1_out`` / ``gemm1_out_scale`` lists of
+        persistent FC1 output buffers, each allocated in its die's memory.
     swap_ab : bool
         Select the optimized SM100/SM103 implementation. Gated FC1 weights
         and scales must use up16/gate16 rows when True, or the existing
@@ -1977,7 +2359,11 @@ def cute_dsl_fused_moe(
 
     if quant_mode in ("w4a8", "mxfp8"):
         _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
-        if torch.cuda.get_device_capability(x.device) == (10, 7):
+        # MXFP8 x MXFP8 runs the SM100-family kernels on SM107 as well.
+        if quant_mode == "w4a8" and torch.cuda.get_device_capability(x.device) == (
+            10,
+            7,
+        ):
             raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
@@ -1986,7 +2372,9 @@ def cute_dsl_fused_moe(
         num_local_experts = num_experts
 
     num_tokens = token_selected_experts.size(0)
-    hidden_size = _moe_hidden_size(w2_weight, localized_weights)
+    hidden_size = _moe_hidden_size(
+        w2_weight, localized_weights, _localized_fc2_split(localized_options)
+    )
 
     if moe_output is None:
         moe_output = torch.empty(
@@ -1998,10 +2386,10 @@ def cute_dsl_fused_moe(
     tuner = AutoTuner.get()
     runners: list[CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner]
 
-    if localized_weights is not None and quant_mode != "w4a4":
+    if localized_weights is not None and quant_mode not in ("w4a4", "mxfp8"):
         raise NotImplementedError(
-            "locality-domain localization is implemented for the W4A4 path "
-            f"only, got quant_mode={quant_mode!r}."
+            "locality-domain localization is implemented for the W4A4 and MXFP8 "
+            f"paths only, got quant_mode={quant_mode!r}."
         )
 
     if quant_mode in ("w4a4", "w4a8", "mxfp8"):
@@ -2045,6 +2433,7 @@ def cute_dsl_fused_moe(
                 localized_streams=localized_streams,
                 localized_sm_count=localized_sm_count,
                 localized_memset_stream=localized_memset_stream,
+                localized_options=localized_options,
             )
             runners = [localized_runner]
             if localized_allow_nonlocalized:
